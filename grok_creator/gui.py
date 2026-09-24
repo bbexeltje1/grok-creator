@@ -360,21 +360,28 @@ class GrokCreatorApp(ctk.CTk):
 
         def worker() -> None:
             try:
-                # Pre-allocate the state file path so we can persist it after sign-up.
-                state_path_holder: dict = {}
+                # Pre-allocate a temp state file inside data/states/_pending
+                tmp_state = self.store.states_dir / "_pending" / "state.json"
+                tmp_state.parent.mkdir(parents=True, exist_ok=True)
 
-                def log_and_capture_state(msg: str) -> None:
-                    self._queue_log(msg)
-
-                # We need the account's email before we know its state path,
-                # so run first, then save state.
                 creds = asyncio.run(
-                    _run_create_with_state(
-                        proxy_url=proxy,
-                        log=log_and_capture_state,
-                        state_path_provider=lambda email: self.store.state_path_for(email),
+                    run_creator(
+                        proxy_url=proxy or None,
+                        log=self._queue_log,
+                        state_path=tmp_state,
                     )
                 )
+
+                # Move the state file into the account-specific folder
+                final_state = self.store.state_path_for(creds["email"])
+                try:
+                    if tmp_state.exists():
+                        final_state.write_bytes(tmp_state.read_bytes())
+                        creds["state_file"] = str(final_state)
+                except OSError:
+                    creds["state_file"] = ""
+
+                creds["proxy"] = proxy
                 self._queue.put(("created", creds))
             except Exception as exc:
                 self._queue.put(("error", f"Creation failed: {exc}"))
@@ -437,11 +444,14 @@ class GrokCreatorApp(ctk.CTk):
                         proxy_url=proxy,
                         state_path=state_path,
                         log=self._queue_log,
+                        # Release the GUI lock as soon as login finishes —
+                        # the browser window stays open independently.
+                        on_login_complete=lambda: self._queue.put(("busy_off", None)),
                     )
                 )
             except Exception as exc:
                 self._queue.put(("error", f"Open failed: {exc}"))
-            finally:
+                # Make sure we never leave the UI locked on error
                 self._queue.put(("busy_off", None))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -466,32 +476,3 @@ class GrokCreatorApp(ctk.CTk):
         self.clipboard_clear()
         self.clipboard_append(text)
         self._log(f"Copied to clipboard: {text}")
-
-
-# --------------------------------------------------------------------------- #
-# Helper wrapper so the creator can save its storage state after learning
-# the email address.
-# --------------------------------------------------------------------------- #
-async def _run_create_with_state(
-    proxy_url: str,
-    log,
-    state_path_provider,
-) -> dict:
-    """Run the creator, save the storage state, and return account data."""
-    from .creator import run_creator as _run
-
-    # We use a small trick: hold the state path in a mutable list that the
-    # creator writes into once it knows the email.
-    result = await _run(
-        proxy_url=proxy_url or None,
-        log=log,
-        state_path=None,   # will fill in below
-    )
-
-    # Save the storage state manually now that we know the email.
-    # (run_creator already closed the browser, so we can't grab state here;
-    #  if you want the state saved, pass the path via the closure below.)
-    state_path = state_path_provider(result["email"])
-    result["state_file"] = str(state_path) if state_path.exists() else ""
-    result["proxy"] = proxy_url
-    return result
